@@ -1,0 +1,58 @@
+# Python
+def calcular(a, b):
+    total = a + b * 2
+    if total > 10:
+        print(total)
+    return total
+
+# Calculo con precedencia de operadores y condiciones compuestas
+def evaluar_lote(base, limite, factor):
+    acumulado = (base + 15) * factor - 4
+    contador = 0
+
+    while contador < limite and acumulado > 0:
+        acumulado = acumulado + contador * 2
+        contador = contador + 1
+
+    if acumulado >= 100 or base == 50:
+        print(acumulado)
+        return acumulado
+    return 0
+
+# Java
+public static void main(String args) {
+    int x = 2;
+    int y = x + 5;
+    System.out.println(y);
+}
+
+# JavaScript
+function sumar(a, b) {
+    const resultado = a + b;
+    console.log(resultado);
+    return resultado;
+}
+
+# C
+#include <stdio.h>
+#define MAX (x + 1)
+
+int main() {
+    int x = 2;
+    int y = x * 3;
+    printf("%d\n", y);
+    return 0;
+}
+
+# Rust
+#include <stdio.h>
+#define MAX (x + 1)
+
+int main() {
+    int x = 2;
+    int y = x * 3;
+    printf("%d\n", y);
+    return 0;
+}
+
+
