@@ -1,3 +1,4 @@
+import copy
 import re
 from tokens import Token, TipoToken
 
@@ -24,6 +25,17 @@ ESTILOS_OVALO = {
     "delimiter": 'fillcolor="#0f172a", color="#64748b", fontcolor="#cbd5e1", penwidth=1.4',
 }
 
+# Niveles de precedencia de menor (arriba en el árbol) a mayor (más profundo)
+PRECEDENCIA_OPERADORES = [
+    {"=", "+=", "-=", "*=", "/=", "%="},
+    {"or", "||"},
+    {"and", "&&"},
+    {"==", "!=", "<", ">", "<=", ">="},
+    {"+", "-"},
+    {"*", "/", "%"},
+]
+TODOS_OPERADORES = set().union(*PRECEDENCIA_OPERADORES)
+
 
 class Parser:
     def __init__(self, lenguaje: str, tokens: list[Token]):
@@ -32,6 +44,7 @@ class Parser:
         self.errores: list[ErrorSintactico] = []
         self._contador_nodos = 0
         self._lineas_dot: list[str] = []
+        self._niveles_rank: list[list[str]] = []
 
     def analizar(self) -> tuple[bool, list[ErrorSintactico], str]:
         self.errores.clear()
@@ -95,560 +108,571 @@ class Parser:
                     if not tiene_dos_puntos:
                         self.errores.append(ErrorSintactico(f"Falta ':' en '{t.valor}'", t.linea, t.columna))
 
-    # --- GENERACIÓN DEL ÁRBOL SINTÁCTICO JERÁRQUICO (AST) ---
-
-    def _clasificar_hoja(self, valor: str) -> str:
-        if re.match(r'^\d+(\.\d+)?$', valor) or valor.startswith(('"', "'")):
+    def _categoria_token(self, tok: Token) -> str:
+        nombre_tipo = tok.tipo.name.upper() if hasattr(tok.tipo, "name") else str(tok.tipo).upper()
+        if "PALABRA" in nombre_tipo or "RESERVADA" in nombre_tipo or "KEYWORD" in nombre_tipo:
+            return "keyword"
+        if "NUMERO" in nombre_tipo or "CADENA" in nombre_tipo or "LITERAL" in nombre_tipo or "CHAR" in nombre_tipo:
             return "literal"
-        if valor in ("True", "False", "None", "true", "false", "null", "undefined"):
+        if "OPERADOR" in nombre_tipo or "OP" in nombre_tipo or tok.valor in TODOS_OPERADORES:
+            return "operator"
+        if "DELIMITADOR" in nombre_tipo or "PUNTUACION" in nombre_tipo or tok.valor in (
+            "()", "{}", "[]", "(", ")", "{", "}", "[", "]", ",", ":", ";", "#"
+        ):
+            return "delimiter"
+        if re.match(r'^\d+(\.\d+)?$', tok.valor) or tok.valor.startswith(('"', "'")):
+            return "literal"
+        if tok.valor in ("True", "False", "None", "true", "false", "null", "undefined", "void", "int", "def"):
             return "keyword"
         return "variable"
 
-    def _nuevo_nodo(self, etiqueta: str, categoria: str = "variable") -> str:
-        self._contador_nodos += 1
-        nid = f"n{self._contador_nodos}"
-        etiqueta_escapada = (
-            etiqueta
+    def _escapar(self, texto: str) -> str:
+        return (
+            texto
             .replace("\\", "\\\\")
             .replace('"', '\\"')
             .replace("\n", "\\n")
             .replace("\r", "")
         )
-        estilo = ESTILOS_OVALO.get(categoria, ESTILOS_OVALO["variable"])
-        self._lineas_dot.append(f'  {nid} [label="{etiqueta_escapada}", {estilo}];')
+
+    def _nuevo_nodo_token(self, tok: Token) -> str:
+        self._contador_nodos += 1
+        nid = f"t{self._contador_nodos}"
+        etiqueta = self._escapar(tok.valor)
+        nombre_tipo = tok.tipo.name if hasattr(tok.tipo, "name") else str(tok.tipo)
+        tooltip = self._escapar(f"Token: '{tok.valor}' | Tipo: {nombre_tipo} | L{tok.linea}:C{tok.columna}")
+        cat = self._categoria_token(tok)
+        estilo = ESTILOS_OVALO.get(cat, ESTILOS_OVALO["variable"])
+        self._lineas_dot.append(
+            f'  {nid} [label="{etiqueta}", tooltip="{tooltip}", {estilo}];'
+        )
         return nid
 
-    def _conectar(self, padre: str, hijo: str):
-        if padre and hijo:
-            self._lineas_dot.append(f"  {padre} -> {hijo};")
+    def _nuevo_nodo_fin(self) -> str:
+        self._contador_nodos += 1
+        nid = f"fin{self._contador_nodos}"
+        estilo = ESTILOS_OVALO["root"]
+        self._lineas_dot.append(
+            f'  {nid} [label="fin", tooltip="Fin del flujo sintáctico", {estilo}];'
+        )
+        return nid
+
+    def _registrar_nivel(self, ids_nodos: list[str]):
+        limpios = [n for n in ids_nodos if n]
+        if len(limpios) == 2:
+            self._niveles_rank.append(limpios)
+
+    def _conectar(self, origen: str, destino: str):
+        if origen and destino:
+            self._lineas_dot.append(f"  {origen} -> {destino};")
+
+    def _conectar_todos(self, origenes: list[str], destino: str):
+        for o in origenes:
+            self._conectar(o, destino)
+
+    def _buscar_cierre(self, toks: list[Token], idx_abre: int, abre: str, cierra: str) -> int:
+        nivel = 1
+        j = idx_abre + 1
+        while j < len(toks) and nivel > 0:
+            if toks[j].valor == abre:
+                nivel += 1
+            elif toks[j].valor == cierra:
+                nivel -= 1
+            j += 1
+        return j - 1 if nivel == 0 else -1
+
+    def _dividir_por_comas(self, toks: list[Token]) -> list[list[Token]]:
+        grupos: list[list[Token]] = []
+        actual: list[Token] = []
+        par = llave = cor = 0
+        for t in toks:
+            if t.valor == "(":
+                par += 1
+            elif t.valor == ")":
+                par = max(0, par - 1)
+            elif t.valor == "{":
+                llave += 1
+            elif t.valor == "}":
+                llave = max(0, llave - 1)
+            elif t.valor == "[":
+                cor += 1
+            elif t.valor == "]":
+                cor = max(0, cor - 1)
+
+            if t.valor == "," and par == 0 and llave == 0 and cor == 0:
+                if actual:
+                    grupos.append(actual)
+                    actual = []
+            else:
+                actual.append(t)
+        if actual:
+            grupos.append(actual)
+        return grupos
+
+    def _construir_lista_binaria(self, items: list[list[Token]]) -> tuple[list[str], list[str]]:
+        """Encadena argumentos/parámetros en pares (máx. 2 ramas) formando diamantes."""
+        if not items:
+            return [], []
+
+        entradas_globales: list[str] = []
+        salidas_previas: list[str] = []
+
+        for idx in range(0, len(items), 2):
+            par = items[idx : idx + 2]
+            ent_par: list[str] = []
+            sal_par: list[str] = []
+
+            for sub_toks in par:
+                e, s = self._construir_expresion(sub_toks)
+                if e:
+                    ent_par.append(e[0])
+                sal_par.extend(s)
+
+            if len(ent_par) == 2:
+                self._registrar_nivel(ent_par)
+
+            if not entradas_globales:
+                entradas_globales = ent_par
+            else:
+                if len(ent_par) == 1:
+                    self._conectar_todos(salidas_previas, ent_par[0])
+                elif len(ent_par) == 2:
+                    # Enlace balanceado para no superar 2 ramas salientes
+                    for s_node in salidas_previas:
+                        self._conectar(s_node, ent_par[0])
+                        self._conectar(s_node, ent_par[1])
+
+            salidas_previas = sal_par
+
+        return entradas_globales, salidas_previas
+
+    def _construir_expresion(self, toks: list[Token]) -> tuple[list[str], list[str]]:
+        """Construye un subárbol binario jerárquico por precedencia de operadores."""
+        if not toks:
+            return [], []
+
+        # Envolver paréntesis externos completos: ( expr ) -> nodo '()' -> expr
+        while len(toks) >= 2 and toks[0].valor == "(" and self._buscar_cierre(toks, 0, "(", ")") == len(toks) - 1:
+            tok_par = copy.copy(toks[0])
+            tok_par.valor = "()"
+            nid_par = self._nuevo_nodo_token(tok_par)
+            internos = toks[1:-1]
+            if not internos:
+                return [nid_par], [nid_par]
+            grupos = self._dividir_por_comas(internos)
+            ent, sal = self._construir_lista_binaria(grupos)
+            for e in ent:
+                self._conectar(nid_par, e)
+            return [nid_par], sal if sal else [nid_par]
+
+        # Buscar operador de menor precedencia fuera de delimitadores (asociatividad izquierda)
+        for nivel_ops in PRECEDENCIA_OPERADORES:
+            par = llave = cor = 0
+            split_idx = -1
+            es_asignacion = "=" in nivel_ops
+
+            indices = range(len(toks)) if es_asignacion else range(len(toks) - 1, -1, -1)
+            for idx in indices:
+                val = toks[idx].valor
+                if val == "(":
+                    par += 1
+                elif val == ")":
+                    par -= 1
+                elif val == "{":
+                    llave += 1
+                elif val == "}":
+                    llave -= 1
+                elif val == "[":
+                    cor += 1
+                elif val == "]":
+                    cor -= 1
+                elif par == 0 and llave == 0 and cor == 0 and val in nivel_ops:
+                    if idx > 0 and idx < len(toks) - 1:
+                        split_idx = idx
+                        break
+
+            if split_idx != -1:
+                op_id = self._nuevo_nodo_token(toks[split_idx])
+                izq_ent, izq_sal = self._construir_expresion(toks[:split_idx])
+                der_ent, der_sal = self._construir_expresion(toks[split_idx + 1 :])
+
+                hijos = []
+                if izq_ent:
+                    self._conectar(op_id, izq_ent[0])
+                    hijos.append(izq_ent[0])
+                if der_ent:
+                    self._conectar(op_id, der_ent[0])
+                    hijos.append(der_ent[0])
+                self._registrar_nivel(hijos)
+
+                return [op_id], izq_sal + der_sal
+
+        # Llamada a función o acceso encadenado con paréntesis al final: fn(a, b)
+        if toks[-1].valor == ")":
+            idx_abre = -1
+            nivel = 0
+            for j in range(len(toks) - 1, -1, -1):
+                if toks[j].valor == ")":
+                    nivel += 1
+                elif toks[j].valor == "(":
+                    nivel -= 1
+                    if nivel == 0:
+                        idx_abre = j
+                        break
+
+            if idx_abre > 0:
+                prefijo = toks[:idx_abre]
+                # Cadena lineal para nombres como System.out.println
+                ent_pref: list[str] = []
+                prev_p: str | None = None
+                for t in prefijo:
+                    if t.valor == ".":
+                        continue
+                    pid = self._nuevo_nodo_token(t)
+                    if prev_p is None:
+                        ent_pref = [pid]
+                    else:
+                        self._conectar(prev_p, pid)
+                    prev_p = pid
+
+                tok_par = copy.copy(toks[idx_abre])
+                tok_par.valor = "()"
+                nid_par = self._nuevo_nodo_token(tok_par)
+                if prev_p:
+                    self._conectar(prev_p, nid_par)
+
+                internos = toks[idx_abre + 1 : -1]
+                if internos:
+                    grupos = self._dividir_por_comas(internos)
+                    arg_ent, arg_sal = self._construir_lista_binaria(grupos)
+                    for e in arg_ent:
+                        self._conectar(nid_par, e)
+                    return ent_pref, arg_sal if arg_sal else [nid_par]
+
+                return ent_pref, [nid_par]
+
+        # Declaración con tipo + asignación o secuencia simple (ej. int x = 2)
+        if len(toks) > 1 and toks[0].valor.isidentifier() and any(t.valor in TODOS_OPERADORES for t in toks[1:]):
+            tipo_id = self._nuevo_nodo_token(toks[0])
+            resto_ent, resto_sal = self._construir_expresion(toks[1:])
+            if resto_ent:
+                self._conectar(tipo_id, resto_ent[0])
+            return [tipo_id], resto_sal if resto_sal else [tipo_id]
+
+        # Fallback secuencial lineal (1 rama por nodo)
+        entrada: list[str] = []
+        prev: str | None = None
+        for t in toks:
+            if t.valor == ",":
+                continue
+            nid = self._nuevo_nodo_token(t)
+            if prev is None:
+                entrada = [nid]
+            else:
+                self._conectar(prev, nid)
+            prev = nid
+        return entrada, [prev] if prev else []
+
+    def _segmentar_sentencias(self, toks: list[Token]) -> list[list[Token]]:
+        """Agrupa tokens en sentencias completas respetando bloques {} y sangría Python."""
+        sentencias: list[list[Token]] = []
+        i = 0
+        n = len(toks)
+
+        while i < n:
+            t = toks[i]
+
+            # Directivas de preprocesador (#include, #define)
+            if t.valor == "#":
+                linea = t.linea
+                j = i
+                while j < n and toks[j].linea == linea:
+                    j += 1
+                sentencias.append(toks[i:j])
+                i = j
+                continue
+
+            # Bloques en Python (def, if, elif, else, while, for, class)
+            if self.lenguaje == "Python" and t.valor in ("def", "if", "elif", "else", "while", "for", "class"):
+                col_bloque = t.columna
+                linea_cab = t.linea
+                j = i
+                # Avanzar hasta ':' de la cabecera
+                while j < n and not (toks[j].valor == ":" and toks[j].linea == linea_cab):
+                    j += 1
+                if j < n and toks[j].valor == ":":
+                    j += 1
+                    # Incluir todas las líneas con sangría mayor a la cabecera
+                    while j < n and (toks[j].linea == linea_cab or toks[j].columna > col_bloque):
+                        j += 1
+                    sentencias.append(toks[i:j])
+                    i = j
+                    continue
+
+            # Sentencias con llaves { ... } o terminadas en ';'
+            actual: list[Token] = []
+            par = llave = 0
+            j = i
+            while j < n:
+                curr = toks[j]
+                if curr.valor == "(":
+                    par += 1
+                elif curr.valor == ")":
+                    par = max(0, par - 1)
+                elif curr.valor == "{":
+                    llave += 1
+                elif curr.valor == "}":
+                    llave = max(0, llave - 1)
+
+                actual.append(curr)
+                j += 1
+
+                if curr.valor == "}" and par == 0 and llave == 0:
+                    break
+                if curr.valor == ";" and par == 0 and llave == 0:
+                    break
+                if (
+                    self.lenguaje == "Python"
+                    and par == 0
+                    and llave == 0
+                    and j < n
+                    and toks[j].linea != curr.linea
+                ):
+                    break
+
+            if actual:
+                sentencias.append(actual)
+            i = j
+
+        return sentencias
+
+    def _construir_sentencia(self, toks: list[Token]) -> tuple[list[str], list[str]]:
+        if not toks:
+            return [], []
+
+        # 1. Directivas #include / #define (flujo controlado de máx. 2 ramas)
+        if toks[0].valor == "#":
+            if len(toks) >= 2 and toks[1].valor == "include":
+                n_inc = self._nuevo_nodo_token(toks[0])
+                n_kw = self._nuevo_nodo_token(toks[1])
+                self._conectar(n_inc, n_kw)
+                prev = n_kw
+                for t in toks[2:]:
+                    nid = self._nuevo_nodo_token(t)
+                    self._conectar(prev, nid)
+                    prev = nid
+                return [n_inc], [prev]
+
+            if len(toks) >= 3 and toks[1].valor == "define":
+                n_num = self._nuevo_nodo_token(toks[0])
+                n_def = self._nuevo_nodo_token(toks[1])
+                n_mac = self._nuevo_nodo_token(toks[2])
+                self._conectar(n_num, n_def)
+                self._conectar(n_def, n_mac)
+                if len(toks) > 3:
+                    val_ent, val_sal = self._construir_expresion(toks[3:])
+                    if val_ent:
+                        self._conectar(n_mac, val_ent[0])
+                    return [n_num], val_sal if val_sal else [n_mac]
+                return [n_num], [n_mac]
+
+        # 2. Estructuras Python con ':' (def, if, elif, else, while, for)
+        if self.lenguaje == "Python" and toks[0].valor in ("def", "if", "elif", "else", "while", "for"):
+            idx_dos_puntos = next((k for k, tk in enumerate(toks) if tk.valor == ":"), -1)
+            if idx_dos_puntos != -1:
+                cabecera = toks[:idx_dos_puntos]
+                tok_dp = toks[idx_dos_puntos]
+                cuerpo_toks = toks[idx_dos_puntos + 1 :]
+
+                n_dp = self._nuevo_nodo_token(tok_dp)
+                sub_sents = self._segmentar_sentencias(cuerpo_toks)
+                cuerpo_sal = self._encadenar_sentencias(sub_sents, inicio=[n_dp])
+
+                kw = cabecera[0].valor
+                n_kw = self._nuevo_nodo_token(cabecera[0])
+
+                if kw == "def":
+                    # def -> nombre -> () -> parámetros -> ':' -> cuerpo
+                    prev_h = n_kw
+                    idx_par = next((k for k, tk in enumerate(cabecera) if tk.valor == "("), -1)
+                    for t in cabecera[1 : idx_par if idx_par != -1 else len(cabecera)]:
+                        nid = self._nuevo_nodo_token(t)
+                        self._conectar(prev_h, nid)
+                        prev_h = nid
+
+                    if idx_par != -1:
+                        idx_cierre = self._buscar_cierre(cabecera, idx_par, "(", ")")
+                        tok_par = copy.copy(cabecera[idx_par])
+                        tok_par.valor = "()"
+                        n_par = self._nuevo_nodo_token(tok_par)
+                        self._conectar(prev_h, n_par)
+
+                        params = cabecera[idx_par + 1 : idx_cierre if idx_cierre != -1 else len(cabecera)]
+                        if params:
+                            grupos = self._dividir_por_comas(params)
+                            p_ent, p_sal = self._construir_lista_binaria(grupos)
+                            for e in p_ent:
+                                self._conectar(n_par, e)
+                            self._conectar_todos(p_sal, n_dp)
+                        else:
+                            self._conectar(n_par, n_dp)
+                    else:
+                        self._conectar(prev_h, n_dp)
+
+                    return [n_kw], cuerpo_sal
+
+                if kw == "else":
+                    self._conectar(n_kw, n_dp)
+                    return [n_kw], cuerpo_sal
+
+                # if / elif / while / for -> 2 ramas: condición (izq) y ':' (der) -> convergen al salir
+                cond_toks = cabecera[1:]
+                cond_ent, cond_sal = self._construir_expresion(cond_toks)
+                hijos = []
+                if cond_ent:
+                    self._conectar(n_kw, cond_ent[0])
+                    hijos.append(cond_ent[0])
+                self._conectar(n_kw, n_dp)
+                hijos.append(n_dp)
+                self._registrar_nivel(hijos)
+
+                return [n_kw], cond_sal + cuerpo_sal
+
+        # 3. Bloques con llaves { ... } en C, Java, JS, Rust
+        if toks[-1].valor == "}":
+            idx_abre_llave = -1
+            nivel = 0
+            for k in range(len(toks) - 1, -1, -1):
+                if toks[k].valor == "}":
+                    nivel += 1
+                elif toks[k].valor == "{":
+                    nivel -= 1
+                    if nivel == 0:
+                        idx_abre_llave = k
+                        break
+
+            if idx_abre_llave != -1:
+                cabecera = toks[:idx_abre_llave]
+                tok_llave = copy.copy(toks[idx_abre_llave])
+                tok_llave.valor = "{}"
+                n_llave = self._nuevo_nodo_token(tok_llave)
+
+                internos = toks[idx_abre_llave + 1 : -1]
+                sub_sents = self._segmentar_sentencias(internos)
+                cuerpo_sal = self._encadenar_sentencias(sub_sents, inicio=[n_llave])
+
+                if not cabecera:
+                    return [n_llave], cuerpo_sal
+
+                # Control con llaves: if (...) { ... }, while (...) { ... }
+                if cabecera[0].valor in ("if", "while", "for"):
+                    n_kw = self._nuevo_nodo_token(cabecera[0])
+                    cond_ent, cond_sal = self._construir_expresion(cabecera[1:])
+                    hijos = []
+                    if cond_ent:
+                        self._conectar(n_kw, cond_ent[0])
+                        hijos.append(cond_ent[0])
+                    self._conectar(n_kw, n_llave)
+                    hijos.append(n_llave)
+                    self._registrar_nivel(hijos)
+                    return [n_kw], cond_sal + cuerpo_sal
+
+                # Función con llaves: int main() { ... } / function sumar(a, b) { ... }
+                idx_par = next((k for k, tk in enumerate(cabecera) if tk.valor == "("), -1)
+                ent_cab: list[str] = []
+                prev_c: str | None = None
+                limite_nombre = idx_par if idx_par != -1 else len(cabecera)
+                for t in cabecera[:limite_nombre]:
+                    nid = self._nuevo_nodo_token(t)
+                    if prev_c is None:
+                        ent_cab = [nid]
+                    else:
+                        self._conectar(prev_c, nid)
+                    prev_c = nid
+
+                if idx_par != -1:
+                    idx_cierre = self._buscar_cierre(cabecera, idx_par, "(", ")")
+                    tok_par = copy.copy(cabecera[idx_par])
+                    tok_par.valor = "()"
+                    n_par = self._nuevo_nodo_token(tok_par)
+                    if prev_c:
+                        self._conectar(prev_c, n_par)
+                    else:
+                        ent_cab = [n_par]
+
+                    params = cabecera[idx_par + 1 : idx_cierre if idx_cierre != -1 else len(cabecera)]
+                    if params:
+                        grupos = self._dividir_por_comas(params)
+                        p_ent, p_sal = self._construir_lista_binaria(grupos)
+                        for e in p_ent:
+                            self._conectar(n_par, e)
+                        self._conectar_todos(p_sal, n_llave)
+                    else:
+                        self._conectar(n_par, n_llave)
+                elif prev_c:
+                    self._conectar(prev_c, n_llave)
+
+                return ent_cab if ent_cab else [n_llave], cuerpo_sal
+
+        # 4. Sentencia simple (con o sin ';' final que cierra el diamante)
+        tiene_pc = toks[-1].valor == ";"
+        cuerpo = toks[:-1] if tiene_pc else toks
+
+        if not cuerpo and tiene_pc:
+            nid_pc = self._nuevo_nodo_token(toks[-1])
+            return [nid_pc], [nid_pc]
+
+        ent, sal = self._construir_expresion(cuerpo)
+        if tiene_pc:
+            nid_pc = self._nuevo_nodo_token(toks[-1])
+            self._conectar_todos(sal, nid_pc)
+            return ent, [nid_pc]
+
+        return ent, sal
+
+    def _encadenar_sentencias(self, sentencias: list[list[Token]], inicio: list[str] | None = None) -> list[str]:
+        prev_salidas: list[str] = list(inicio) if inicio else []
+        for s_toks in sentencias:
+            ent, sal = self._construir_sentencia(s_toks)
+            if ent:
+                if prev_salidas:
+                    self._conectar_todos(prev_salidas, ent[0])
+                prev_salidas = sal if sal else ent
+        return prev_salidas
 
     def _construir_arbol_dot(self) -> str:
         self._contador_nodos = 0
+        self._niveles_rank = []
         self._lineas_dot = [
-            "digraph ArbolSintactico {",
+            "digraph JerarquiaTokens {",
             '  bgcolor="transparent";',
-            '  pad="0.2";',
+            '  pad="0.3";',
             '  rankdir=TB;',
-            '  splines=line;',
-            '  nodesep=0.55;',
-            '  ranksep=0.48;',
+            '  splines=polyline;',
+            '  nodesep=0.60;',
+            '  ranksep=0.45;',
             (
                 '  node [shape=ellipse, style="filled", penwidth=1.8, '
-                'fontname="Consolas", fontsize=14, '
-                'margin="0.20,0.08", width=0.8, height=0.42];'
+                'fontname="Consolas", fontsize=13, '
+                'margin="0.18,0.07", width=0.58, height=0.36];'
             ),
-            '  edge [arrowhead=vee, arrowsize=0.65, color="#64748b", penwidth=1.6];',
+            '  edge [arrowhead=vee, arrowsize=0.62, color="#38bdf8", penwidth=1.55];',
         ]
 
-        codigo_limpio = "".join(
-            t.valor for t in self.tokens if t.tipo != TipoToken.COMENTARIO
-        )
-        sentencias = self._extraer_sentencias(codigo_limpio)
+        tokens_limpios = [
+            t for t in self.tokens
+            if t.tipo not in (TipoToken.ESPACIO, TipoToken.SALTO_LINEA, TipoToken.COMENTARIO)
+        ]
 
-        n_raiz = self._nuevo_nodo("Programa", "root")
-        for sent in sentencias:
-            self._procesar_sentencia(sent, n_raiz)
+        sentencias = self._segmentar_sentencias(tokens_limpios)
+        salidas_finales = self._encadenar_sentencias(sentencias)
+
+        if salidas_finales:
+            fin_id = self._nuevo_nodo_fin()
+            self._conectar_todos(salidas_finales, fin_id)
+
+        for grupo_mismo_nivel in self._niveles_rank:
+            self._lineas_dot.append(f'  {{ rank=same; {"; ".join(grupo_mismo_nivel)}; }}')
 
         self._lineas_dot.append("}")
         return "\n".join(self._lineas_dot)
-
-    def _extraer_sentencias(self, codigo: str) -> list[str]:
-        if self.lenguaje == "Python":
-            return self._extraer_sentencias_python(codigo)
-
-        sentencias = []
-        actual = []
-        llaves = 0
-        parentesis = 0
-        en_comilla = None
-
-        for linea in codigo.splitlines():
-            s = linea.strip()
-            if not s:
-                continue
-
-            if s.startswith("#") and llaves == 0 and not actual:
-                sentencias.append(s)
-                continue
-
-            for ch in linea + "\n":
-                if ch in ('"', "'"):
-                    if en_comilla == ch:
-                        en_comilla = None
-                    elif en_comilla is None:
-                        en_comilla = ch
-
-                if en_comilla is None:
-                    if ch == "(":
-                        parentesis += 1
-                    elif ch == ")":
-                        parentesis -= 1
-                    elif ch == "{":
-                        llaves += 1
-                    elif ch == "}":
-                        llaves -= 1
-
-                actual.append(ch)
-
-                if en_comilla is None and parentesis == 0 and llaves == 0:
-                    if ch in (";", "}"):
-                        bloque = "".join(actual).strip()
-                        if bloque:
-                            sentencias.append(bloque)
-                        actual = []
-                    elif ch == "\n" and "".join(actual).strip():
-                        texto_actual = "".join(actual).strip()
-                        if not texto_actual.endswith((")", "{", ",")):
-                            sentencias.append(texto_actual)
-                            actual = []
-
-        resto = "".join(actual).strip()
-        if resto:
-            sentencias.append(resto)
-        return sentencias
-
-    def _extraer_sentencias_python(self, codigo: str) -> list[str]:
-        lineas = [l for l in codigo.splitlines() if l.strip()]
-        sentencias = []
-        i = 0
-        while i < len(lineas):
-            linea = lineas[i]
-            indent_actual = len(linea) - len(linea.lstrip())
-            s = linea.strip()
-
-            if s.endswith(":"):
-                bloque = [linea[indent_actual:]]
-                i += 1
-                while i < len(lineas):
-                    sig_linea = lineas[i]
-                    sig_indent = len(sig_linea) - len(sig_linea.lstrip())
-                    sig_s = sig_linea.strip()
-                    if sig_indent > indent_actual:
-                        bloque.append(sig_linea[indent_actual:])
-                        i += 1
-                    elif sig_indent == indent_actual and sig_s.startswith(("elif ", "else:")):
-                        bloque.append(sig_linea[indent_actual:])
-                        i += 1
-                    else:
-                        break
-                sentencias.append("\n".join(bloque))
-            else:
-                sentencias.append(s)
-                i += 1
-        return sentencias
-
-    def _procesar_sentencia(self, sent: str, padre: str):
-        sent = sent.strip()
-        if not sent:
-            return
-
-        tiene_pc = sent.endswith(";")
-        sin_pc = sent[:-1].strip() if tiene_pc else sent
-
-        # 1. Directiva #define
-        m_def = re.match(r'^#\s*define\s+([a-zA-Z_]\w*)\s*(.*)$', sent)
-        if m_def:
-            nombre, resto = m_def.group(1), m_def.group(2).strip()
-            n_def = self._nuevo_nodo(f"#define: {nombre}", "keyword")
-            self._conectar(padre, n_def)
-            if resto:
-                self._procesar_expresion(resto, n_def)
-            return
-
-        # 2. Directiva #include
-        m_inc = re.match(r'^#\s*include\s*(.+)$', sent)
-        if m_inc:
-            n_inc = self._nuevo_nodo(f"#include {m_inc.group(1).strip()}", "keyword")
-            self._conectar(padre, n_inc)
-            return
-
-        # 3. Funciones en C, Java, JS, Rust
-        m_func = re.match(
-            r'^(?:(?:public|private|protected|static|async|pub)\s+)*'
-            r'(void|int|float|double|char|boolean|String|fn|function)\s+'
-            r'([a-zA-Z_]\w*)\s*\(([^)]*)\)\s*(?:->\s*[^{]+\s*)?\{(.*)\}$',
-            sent,
-            flags=re.DOTALL,
-        )
-        if m_func:
-            tipo_ret, nombre_fn, params, cuerpo = m_func.groups()
-            n_fn = self._nuevo_nodo(f"Función: {nombre_fn}", "keyword")
-            self._conectar(padre, n_fn)
-
-            # Tipo
-            n_tipo = self._nuevo_nodo(f"Tipo: {tipo_ret}", "structure")
-            self._conectar(n_fn, n_tipo)
-
-            # Parámetros
-            n_params = self._nuevo_nodo("Parámetros", "structure")
-            self._conectar(n_fn, n_params)
-            if params.strip():
-                for p in [x.strip().split(":")[0].split()[-1] for x in params.split(",") if x.strip()]:
-                    np = self._nuevo_nodo(p, "variable")
-                    self._conectar(n_params, np)
-            else:
-                nv = self._nuevo_nodo("()", "delimiter")
-                self._conectar(n_params, nv)
-
-            # Cuerpo
-            n_cuerpo = self._nuevo_nodo("Cuerpo", "structure")
-            self._conectar(n_fn, n_cuerpo)
-            sub_sentencias = self._extraer_sentencias(cuerpo)
-            for sub in sub_sentencias:
-                self._procesar_sentencia(sub, n_cuerpo)
-            return
-
-        # 4. Funciones en Python: def nombre(params):
-        m_py_func = re.match(
-            r'^def\s+([a-zA-Z_]\w*)\s*\(([^)]*)\)\s*:\s*\n(.*)$',
-            sent,
-            flags=re.DOTALL,
-        )
-        if m_py_func:
-            nombre_fn, params, cuerpo = m_py_func.groups()
-            n_fn = self._nuevo_nodo(f"Función: {nombre_fn}", "keyword")
-            self._conectar(padre, n_fn)
-
-            # Parámetros
-            n_params = self._nuevo_nodo("Parámetros", "structure")
-            self._conectar(n_fn, n_params)
-            if params.strip():
-                for p in [x.strip().split(":")[0].split("=")[0].strip() for x in params.split(",") if x.strip()]:
-                    np = self._nuevo_nodo(p, "variable")
-                    self._conectar(n_params, np)
-            else:
-                nv = self._nuevo_nodo("()", "delimiter")
-                self._conectar(n_params, nv)
-
-            # Cuerpo
-            n_cuerpo = self._nuevo_nodo("Cuerpo", "structure")
-            self._conectar(n_fn, n_cuerpo)
-            sub_sentencias = self._extraer_sentencias(cuerpo)
-            for sub in sub_sentencias:
-                self._procesar_sentencia(sub, n_cuerpo)
-            return
-
-        # 5. Condicional if (...) { ... } [else { ... }]
-        m_if = re.match(
-            r'^if\s*\((.+?)\)\s*\{(.*?)\}(?:\s*else\s*\{(.*)\})?$',
-            sent,
-            flags=re.DOTALL,
-        )
-        if m_if:
-            cond, cuerpo_if, cuerpo_else = m_if.groups()
-            n_if = self._nuevo_nodo("if", "keyword")
-            self._conectar(padre, n_if)
-
-            n_cond = self._nuevo_nodo("Condición", "structure")
-            self._conectar(n_if, n_cond)
-            self._procesar_expresion(cond, n_cond)
-
-            n_then = self._nuevo_nodo("Entonces", "structure")
-            self._conectar(n_if, n_then)
-            for sub in self._extraer_sentencias(cuerpo_if):
-                self._procesar_sentencia(sub, n_then)
-
-            if cuerpo_else is not None:
-                n_else = self._nuevo_nodo("Sino", "structure")
-                self._conectar(n_if, n_else)
-                for sub in self._extraer_sentencias(cuerpo_else):
-                    self._procesar_sentencia(sub, n_else)
-            return
-
-        # 6. Condicional if en Python: if cond:\n... [else:\n...]
-        m_py_if = re.match(
-            r'^if\s+(.+?)\s*:\s*\n(.*?)(?:\nelse\s*:\s*\n(.*))?$',
-            sent,
-            flags=re.DOTALL,
-        )
-        if m_py_if:
-            cond, cuerpo_if, cuerpo_else = m_py_if.groups()
-            n_if = self._nuevo_nodo("if", "keyword")
-            self._conectar(padre, n_if)
-
-            n_cond = self._nuevo_nodo("Condición", "structure")
-            self._conectar(n_if, n_cond)
-            self._procesar_expresion(cond, n_cond)
-
-            n_then = self._nuevo_nodo("Entonces", "structure")
-            self._conectar(n_if, n_then)
-            for sub in self._extraer_sentencias(cuerpo_if):
-                self._procesar_sentencia(sub, n_then)
-
-            if cuerpo_else is not None:
-                n_else = self._nuevo_nodo("Sino", "structure")
-                self._conectar(n_if, n_else)
-                for sub in self._extraer_sentencias(cuerpo_else):
-                    self._procesar_sentencia(sub, n_else)
-            return
-
-        # 7. Ciclo while (...) { ... }
-        m_while = re.match(r'^while\s*\((.+?)\)\s*\{(.*)\}$', sent, flags=re.DOTALL)
-        if m_while:
-            cond, cuerpo = m_while.groups()
-            n_while = self._nuevo_nodo("while", "keyword")
-            self._conectar(padre, n_while)
-
-            n_cond = self._nuevo_nodo("Condición", "structure")
-            self._conectar(n_while, n_cond)
-            self._procesar_expresion(cond, n_cond)
-
-            n_cuerpo = self._nuevo_nodo("Cuerpo", "structure")
-            self._conectar(n_while, n_cuerpo)
-            for sub in self._extraer_sentencias(cuerpo):
-                self._procesar_sentencia(sub, n_cuerpo)
-            return
-
-        # 8. Ciclo while en Python: while cond:\n...
-        m_py_while = re.match(r'^while\s+(.+?)\s*:\s*\n(.*)$', sent, flags=re.DOTALL)
-        if m_py_while:
-            cond, cuerpo = m_py_while.groups()
-            n_while = self._nuevo_nodo("while", "keyword")
-            self._conectar(padre, n_while)
-
-            n_cond = self._nuevo_nodo("Condición", "structure")
-            self._conectar(n_while, n_cond)
-            self._procesar_expresion(cond, n_cond)
-
-            n_cuerpo = self._nuevo_nodo("Cuerpo", "structure")
-            self._conectar(n_while, n_cuerpo)
-            for sub in self._extraer_sentencias(cuerpo):
-                self._procesar_sentencia(sub, n_cuerpo)
-            return
-
-        # 9. Ciclo for en Python: for var in iter:\n...
-        m_py_for = re.match(r'^for\s+([a-zA-Z_]\w*)\s+in\s+(.+?)\s*:\s*\n(.*)$', sent, flags=re.DOTALL)
-        if m_py_for:
-            var_iter, iterable, cuerpo = m_py_for.groups()
-            n_for = self._nuevo_nodo("for", "keyword")
-            self._conectar(padre, n_for)
-
-            n_iter = self._nuevo_nodo(f"Iterador: {var_iter}", "variable")
-            self._conectar(n_for, n_iter)
-
-            n_en = self._nuevo_nodo("En", "structure")
-            self._conectar(n_for, n_en)
-            self._procesar_expresion(iterable, n_en)
-
-            n_cuerpo = self._nuevo_nodo("Cuerpo", "structure")
-            self._conectar(n_for, n_cuerpo)
-            for sub in self._extraer_sentencias(cuerpo):
-                self._procesar_sentencia(sub, n_cuerpo)
-            return
-
-        # 10. Bloque { ... }
-        if sent.startswith("{") and sent.endswith("}"):
-            n_bloque = self._nuevo_nodo("Bloque", "structure")
-            self._conectar(padre, n_bloque)
-            for sub in self._extraer_sentencias(sent[1:-1]):
-                self._procesar_sentencia(sub, n_bloque)
-            return
-
-        # 11. Declaración múltiple: int w, x, y;
-        m_multi = re.match(
-            r'^(int|float|double|char|boolean|String|let|var|const)\s+([a-zA-Z_]\w*(?:\s*,\s*[a-zA-Z_]\w*)+)$',
-            sin_pc,
-        )
-        if m_multi:
-            tipo_var, vars_str = m_multi.groups()
-            n_decl = self._nuevo_nodo(f"Declaración ({tipo_var})", "keyword")
-            self._conectar(padre, n_decl)
-            for v in vars_str.split(","):
-                nv = self._nuevo_nodo(v.strip(), "variable")
-                self._conectar(n_decl, nv)
-            return
-
-        # 12. Declaración con asignación: int x = 2; / let mut x = 2;
-        m_decl_asig = re.match(
-            r'^(int|float|double|char|boolean|String|let\s+mut|let|var|const)\s+([a-zA-Z_]\w*)(?:\s*:\s*[\w<>]+)?\s*=\s*(.+)$',
-            sin_pc,
-        )
-        if m_decl_asig:
-            tipo_var, var_nom, expr = m_decl_asig.groups()
-            n_decl = self._nuevo_nodo(f"Declaración ({tipo_var})", "keyword")
-            self._conectar(padre, n_decl)
-
-            n_igual = self._nuevo_nodo("=", "operator")
-            self._conectar(n_decl, n_igual)
-
-            n_var = self._nuevo_nodo(var_nom, "variable")
-            self._conectar(n_igual, n_var)
-            self._procesar_expresion(expr, n_igual)
-            return
-
-        # 13. Declaración simple: int x;
-        m_decl_simple = re.match(
-            r'^(int|float|double|char|boolean|String|let\s+mut|let|var|const)\s+([a-zA-Z_]\w*)$',
-            sin_pc,
-        )
-        if m_decl_simple:
-            tipo_var, var_nom = m_decl_simple.groups()
-            n_decl = self._nuevo_nodo(f"Declaración ({tipo_var})", "keyword")
-            self._conectar(padre, n_decl)
-            n_var = self._nuevo_nodo(var_nom, "variable")
-            self._conectar(n_decl, n_var)
-            return
-
-        # 14. Asignación directa: x = 2; / w = i + j;
-        m_asig = re.match(r'^([a-zA-Z_]\w*)\s*=\s*(.+)$', sin_pc)
-        if m_asig and not sin_pc.startswith(("if", "while", "for")):
-            var_nom, expr = m_asig.groups()
-            n_igual = self._nuevo_nodo("=", "operator")
-            self._conectar(padre, n_igual)
-
-            n_var = self._nuevo_nodo(var_nom, "variable")
-            self._conectar(n_igual, n_var)
-            self._procesar_expresion(expr, n_igual)
-            return
-
-        # 15. Incremento / decremento: contador++
-        m_inc_dec = re.match(r'^([a-zA-Z_]\w*)\s*(\+\+|--)$', sin_pc)
-        if m_inc_dec:
-            var_nom, op = m_inc_dec.groups()
-            n_op = self._nuevo_nodo(op, "operator")
-            self._conectar(padre, n_op)
-            n_var = self._nuevo_nodo(var_nom, "variable")
-            self._conectar(n_op, n_var)
-            return
-
-        # 16. Llamada a función: printf("%d\n", x); / print(x)
-        m_call = re.match(r'^([a-zA-Z_][\w.:!]*)\s*\((.*)\)$', sin_pc, flags=re.DOTALL)
-        if m_call:
-            fn_nom, args_str = m_call.groups()
-            cat_fn = "keyword" if fn_nom in ("printf", "scanf", "print", "println!", "System.out.println") else "variable"
-            n_fn = self._nuevo_nodo(f"Llamada: {fn_nom}", cat_fn)
-            self._conectar(padre, n_fn)
-
-            if args_str.strip():
-                n_args = self._nuevo_nodo("Argumentos", "structure")
-                self._conectar(n_fn, n_args)
-                for arg in self._dividir_argumentos(args_str):
-                    self._procesar_expresion(arg.strip(), n_args)
-            else:
-                n_par = self._nuevo_nodo("()", "delimiter")
-                self._conectar(n_fn, n_par)
-            return
-
-        # 17. Return
-        if sin_pc.startswith("return"):
-            expr = sin_pc[6:].strip()
-            n_ret = self._nuevo_nodo("return", "keyword")
-            self._conectar(padre, n_ret)
-            if expr:
-                self._procesar_expresion(expr, n_ret)
-            return
-
-        # 18. Respaldo general
-        n_gen = self._nuevo_nodo(sin_pc, self._clasificar_hoja(sin_pc))
-        self._conectar(padre, n_gen)
-
-    def _quitar_parentesis_externos(self, expr: str) -> str:
-        expr = expr.strip()
-        while expr.startswith("(") and expr.endswith(")"):
-            nivel = 0
-            envuelve_todo = True
-            for i, ch in enumerate(expr):
-                if ch == "(":
-                    nivel += 1
-                elif ch == ")":
-                    nivel -= 1
-                if nivel == 0 and i < len(expr) - 1:
-                    envuelve_todo = False
-                    break
-            if envuelve_todo:
-                expr = expr[1:-1].strip()
-            else:
-                break
-        return expr
-
-    def _procesar_expresion(self, expr: str, padre: str):
-        expr = self._quitar_parentesis_externos(expr)
-        if not expr:
-            return
-
-        grupos_operadores = [
-            ("||", "or"),
-            ("&&", "and"),
-            ("===", "!==", "==", "!="),
-            ("<=", ">=", "<", ">"),
-            ("+", "-"),
-            ("*", "/", "%"),
-        ]
-
-        for ops in grupos_operadores:
-            nivel = 0
-            en_comilla = None
-            for i in range(len(expr) - 1, -1, -1):
-                ch = expr[i]
-                if ch in ('"', "'"):
-                    if en_comilla == ch:
-                        en_comilla = None
-                    elif en_comilla is None:
-                        en_comilla = ch
-                if en_comilla is not None:
-                    continue
-
-                if ch == ")":
-                    nivel += 1
-                elif ch == "(":
-                    nivel -= 1
-                elif nivel == 0:
-                    for op in ops:
-                        if expr[i:i + len(op)] == op:
-                            if op.isalpha():
-                                antes_ok = i == 0 or not expr[i - 1].isalnum()
-                                desp_ok = (i + len(op) == len(expr)) or not expr[i + len(op)].isalnum()
-                                if not (antes_ok and desp_ok):
-                                    continue
-
-                            izq = expr[:i].strip()
-                            der = expr[i + len(op):].strip()
-                            if izq and der:
-                                n_op = self._nuevo_nodo(op, "operator")
-                                self._conectar(padre, n_op)
-                                self._procesar_expresion(izq, n_op)
-                                self._procesar_expresion(der, n_op)
-                                return
-
-        m_call = re.match(r'^([a-zA-Z_][\w.:!]*)\s*\((.*)\)$', expr, flags=re.DOTALL)
-        if m_call:
-            fn_nom, args_str = m_call.groups()
-            n_fn = self._nuevo_nodo(f"Llamada: {fn_nom}", "variable")
-            self._conectar(padre, n_fn)
-            if args_str.strip():
-                n_args = self._nuevo_nodo("Argumentos", "structure")
-                self._conectar(n_fn, n_args)
-                for arg in self._dividir_argumentos(args_str):
-                    self._procesar_expresion(arg.strip(), n_args)
-            else:
-                n_par = self._nuevo_nodo("()", "delimiter")
-                self._conectar(n_fn, n_par)
-            return
-
-        n_hoja = self._nuevo_nodo(expr, self._clasificar_hoja(expr))
-        self._conectar(padre, n_hoja)
-
-    def _dividir_argumentos(self, args_str: str) -> list[str]:
-        args = []
-        actual = []
-        nivel = 0
-        en_comilla = None
-        for ch in args_str:
-            if ch in ('"', "'"):
-                if en_comilla == ch:
-                    en_comilla = None
-                elif en_comilla is None:
-                    en_comilla = ch
-            if en_comilla is None:
-                if ch == "(":
-                    nivel += 1
-                elif ch == ")":
-                    nivel -= 1
-                elif ch == "," and nivel == 0:
-                    args.append("".join(actual))
-                    actual = []
-                    continue
-            actual.append(ch)
-        if actual:
-            args.append("".join(actual))
-        return args
